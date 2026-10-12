@@ -1,0 +1,275 @@
+# =============================================================================
+# docker-compose.yml
+# =============================================================================
+# PROPÓSITO
+#   Provisionar TODO o ambiente local do desafio "Processamento Distribuído de
+#   Apostas" com um único comando: `docker compose up`. Nenhuma peça de
+#   infraestrutura é mockada aqui — os testes de integração (§13 do spec)
+#   dependem de containers reais de PostgreSQL, Keycloak e LocalStack.
+#
+# CAMADA DA ARQUITETURA HEXAGONAL
+#   infrastructure bootstrap (o "fora" do hexágono). Este arquivo não faz parte
+#   do código Go; ele apenas materializa os adapters externos que o domínio
+#   desconhece: o banco (adapter outbound Postgres), o broker (SQS/LocalStack)
+#   e o Identity Provider (Keycloak).
+#
+# POR QUE ASSIM (decisões estruturais tomadas aqui)
+#   1. PostgreSQL 16 (alpine): é a persistência obrigatória (§4). A alpine é a
+#      imagem oficial menor; nada de extensões exóticas para não acoplar o
+#      schema a recursos fora do padrão.
+#   2. LocalStack: emula a AWS SQS localmente (§4/§10). Usamos a família de
+#      filas FIFO (`wager-transactions.fifo`) porque o spec exige
+#      `MessageGroupId` para ordenação por carteira (§10/§8).
+#   3. Keycloak: IdP OAuth2/OIDC recomendado (§2). O realm é provisionado de
+#      forma declarativa por import de arquivo (realm-export.json), o que
+#      atende ao §15 ("provisionamento automático do IdP e identidades de teste")
+#      sem intervenção manual no console de administração.
+#   4. Serviço `migrate` one-shot: aplica as migrations (golang-migrate) antes
+#      de a aplicação subir. Reexecutar `up` é idempotente (no-op quando não há
+#      versão nova a aplicar), então pode rodar a cada `compose up` sem risco.
+#   5. Serviços `api` e `worker` NÃO estão aqui ainda de propósito: eles só
+#      passam a existir quando houver Dockerfile e código Fx (Passo 6). Incluir
+#      agora criaria um serviço que falha ao compilar — "não deixar placeholder
+#      que não roda" é parte do critério de pronto.
+#
+# VALIDAÇÃO LOCAL
+#   docker compose up -d
+#   docker compose ps              # todos os healthchecks devem ficar "healthy"
+#   docker compose logs -f migrate # deve terminar com "no change" ou "applied"
+#
+# ARMADILHA CLÁSSICA DE COMPOSE
+#   `depends_on` com `condition: service_healthy` é o ÚNICO jeito confiável de
+#   ordenar subida: `depends_on` simples só espera o container INICIAR, não
+#   ficar pronto. Sem healthcheck, o migrate conecta num Postgres que ainda
+#   está subindo e falha de forma intermitente ("connection refused").
+# =============================================================================
+
+# `name:` fixa o nome do projeto Compose. Sem isso, o nome derivaria do diretório
+# e quebraria referências de rede/volume entre máquinas (reprodutibilidade §15).
+name: wager-backend
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — persistência transacional (wallets, transactions, ledger,
+  # inbox, outbox). É o coração das garantias do §5: constraints e locks são
+  # impostos AQUI, não na aplicação.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: wager-postgres
+    environment:
+      # Credenciais locais de exemplo. Em produção viriam de secrets; aqui o
+      # objetivo é reprodutibilidade, nunca comprometer dados reais.
+      POSTGRES_USER: ${POSTGRES_USER:-wager}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wager}
+      POSTGRES_DB: ${POSTGRES_DB:-wager}
+      # Força UTF-8 e collation estável: o hash de idempotência (§9) precisa ser
+      # determinístico, e comparações de texto não podem variar por locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # 5432 exposto no host para rodar `psql`/testcontainers manualmente.
+      - "5432:5432"
+    volumes:
+      # Volume nomeado: os dados sobrevivem a `compose down` (sem `-v`), o que
+      # permite validar "idempotência sobrevive a restart" (§13.8).
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # pg_isready é o teste oficial: retorna 0 apenas quando o servidor
+      # aceita conexões. É o que destrava o `depends_on` do migrate.
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wager} -d ${POSTGRES_DB:-wager}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # LocalStack — broker SQS emulado (§4/§10). Provisiona as filas FIFO e a DLQ
+  # automaticamente via script em /etc/localstack/init/ready.d (executado pelo
+  # LocalStack quando o serviço fica pronto).
+  # ---------------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3.8
+    container_name: wager-localstack
+    environment:
+      # Habilita SOMENTE o serviço SQS: subir serviços não usados desperdiça
+      # memória e torna o startup lento e ruidoso nos logs.
+      SERVICES: sqs
+      DEBUG: "0"
+      # A região precisa ser consistente entre LocalStack e o SDK Go
+      # (aws-sdk-go-v2), caso contrário a assinatura SigV4 não casa.
+      AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+    ports:
+      # 4566 é a porta única (edge) do LocalStack para todos os serviços AWS.
+      - "4566:4566"
+    volumes:
+      # `ready.d`: scripts aqui rodam UMA vez, quando o LocalStack está pronto.
+      # É o hook correto para provisionar filas (não `boot.d`, que roda antes).
+      - ./deploy/localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+      # O socket do Docker é necessário para o LocalStack em alguns modos;
+      # mantemos o volume de dados para que as filas persistam no volume.
+      - localstack-data:/var/lib/localstack
+    healthcheck:
+      # Endpoint de saúde do próprio LocalStack. Só marcamos healthy quando o
+      # edge HTTP responde, garantindo que o script de filas já pôde rodar.
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # ---------------------------------------------------------------------------
+  # Keycloak — IdP OAuth2/OIDC (§2). Modo `start-dev --import-realm` sobe em
+  # segundos e importa o realm declarativo de deploy/keycloak/realm-export.json,
+  # criando os clients `internal-service`, `provider-a` e `provider-b`.
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: wager-keycloak
+    # `--import-realm` lê arquivos .json de /opt/keycloak/data/import no boot.
+    # É idempotente para um realm já existente (não sobrescreve alterações feitas
+    # em runtime). start-dev NÃO é para produção — aqui é ambiente local.
+    command: ["start-dev", "--import-realm", "--health-enabled=true"]
+    environment:
+      # Bootstrap do usuário admin do console (Keycloak 26 usa KC_BOOTSTRAP_*).
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Permitimos HTTP porque o TLS é encerrado no edge/proxy em produção e o
+      # ambiente local é HTTP puro. Em prod/dev com TLS, isto ficaria "external".
+      KC_HTTP_ENABLED: "true"
+      # `KC_HOSTNAME` fixa o emissor (`iss`) que o Keycloak coloca nos tokens:
+      # "http://localhost:8080/realms/wager" — o MESMO endereço que o
+      # desenvolvedor usa para pedir o token.
+      #
+      # Isto resolve o problema clássico de "issuer mismatch": dentro da rede do
+      # Compose, a API alcança o Keycloak por `keycloak:8080`, mas o `iss` do
+      # token diz `localhost:8080`. É por isso que a aplicação tem DUAS
+      # variáveis (KEYCLOAK_ISSUER para validar o token e KEYCLOAK_JWKS_URL para
+      # buscar as chaves) em vez de derivar uma da outra.
+      KC_HOSTNAME: http://localhost:8080
+    ports:
+      - "8080:8080"   # endpoint público OIDC (issuer/authorize/token/jwks)
+      - "9000:9000"   # management port: /health/ready e /health/live
+    volumes:
+      # Diretório lido pelo --import-realm. Montamos a pasta inteira (padrão do
+      # Keycloak), e não o arquivo avulso, para permitir múltiplos realms.
+      - ./deploy/keycloak:/opt/keycloak/data/import:ro
+    healthcheck:
+      # A imagem do Keycloak não garante `curl`. Usamos o recurso /dev/tcp do
+      # bash: se o TCP do management port aceita conexão, o processo subiu.
+      # O endpoint de saúde real (/health/ready) é mais forte, mas exige HTTP;
+      # esta checagem evita depender de binários que podem não existir na imagem.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Migrations — serviço one-shot que aplica o schema versionado (golang-migrate)
+  # antes de qualquer aplicação conectar. Atende ao §4 ("migrations versionadas,
+  # com aplicação e reversão documentadas").
+  # ---------------------------------------------------------------------------
+  migrate:
+    image: migrate/migrate:v4.18.1
+    container_name: wager-migrate
+    depends_on:
+      # Garante que o Postgres está aceitando conexões (não apenas iniciado).
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Montamos ./migrations em modo leitura: o serviço só lê os arquivos .sql.
+      - ./migrations:/migrations:ro
+    command:
+      - "-path=/migrations"
+      - "-database=postgres://${POSTGRES_USER:-wager}:${POSTGRES_PASSWORD:-wager}@postgres:5432/${POSTGRES_DB:-wager}?sslmode=disable"
+      # `up` aplica todas as migrations pendentes em ordem e é idempotente.
+      - "up"
+    restart: "no"   # roda uma vez; se falhar, queremos vê-lo falhar, não loopar.
+
+  # ---------------------------------------------------------------------------
+  # API HTTP (§9). Sem `container_name` de propósito: assim o serviço pode ser
+  # escalado (`--scale api=2`) para os cenários de múltiplas instâncias (§8).
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      args:
+        TARGET: api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      # A API só sobe DEPOIS de o schema estar criado. `service_completed_successfully`
+      # é a condição correta para um serviço one-shot (o migrate sai com 0).
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://${POSTGRES_USER:-wager}:${POSTGRES_PASSWORD:-wager}@postgres:5432/${POSTGRES_DB:-wager}?sslmode=disable
+      # Emissor (para validar o `iss`) e endpoint interno do JWKS (para buscar as
+      # chaves) são coisas diferentes — ver o comentário em KC_HOSTNAME acima.
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/wager
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
+      SQS_TRANSACTIONS_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://localstack:4566
+      # Credenciais de TESTE do LocalStack: precisam existir para a assinatura
+      # SigV4, mas o valor é irrelevante. Nunca use isto fora do ambiente local.
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      SHUTDOWN_TIMEOUT: 20s
+      # Servidor de métricas em porta SEPARADA da API (§12): em produção ele
+      # ficaria numa rede interna, com política de acesso própria.
+      METRICS_ADDR: ":9090"
+    ports:
+      # 8081 no host porque 8080 já é o Keycloak.
+      - "8081:8080"
+      - "9090:9090"
+
+  # ---------------------------------------------------------------------------
+  # WORKER (§7/§10/§11): consumidor SQS + relay do outbox + worker de referências.
+  #
+  # `deploy.replicas: 3` atende ao §8 ("pelo menos três processos independentes,
+  # cada um com suas próprias conexões e memória"). Cada réplica abre seu próprio
+  # pool e tem seu próprio espaço de memória — a coordenação acontece no banco,
+  # por locks de linha, e não por estado compartilhado.
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      args:
+        TARGET: worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 3
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-wager}:${POSTGRES_PASSWORD:-wager}@postgres:5432/${POSTGRES_DB:-wager}?sslmode=disable
+      KEYCLOAK_ISSUER: http://localhost:8080/realms/wager
+      KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/wager/protocol/openid-connect/certs
+      SQS_TRANSACTIONS_QUEUE_URL: http://localstack:4566/000000000000/wager-transactions.fifo
+      SQS_EVENTS_QUEUE_URL: http://localstack:4566/000000000000/wager-events.fifo
+      SQS_CONSUMER_NAME: wager-transactions-worker
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # O prazo de encerramento precisa ser compatível com o visibility timeout.
+      SHUTDOWN_TIMEOUT: 25s
+      METRICS_ADDR: ":9090"
+
+# -----------------------------------------------------------------------------
+# Volumes nomeados — dados persistentes entre restarts do Compose.
+# -----------------------------------------------------------------------------
+volumes:
+  postgres-data:
+  localstack-data:
