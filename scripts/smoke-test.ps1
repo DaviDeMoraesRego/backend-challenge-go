@@ -1,36 +1,16 @@
 <#
-=============================================================================
-scripts/smoke-test.ps1
-=============================================================================
-PROPOSITO
-	Exercitar a API ponta a ponta contra o ambiente do docker compose:
-	autenticacao real no Keycloak, abertura de carteira, apostas, idempotencia,
-	rejeicao por saldo, extrato paginado, reconciliacao e ISOLAMENTO ENTRE
-	PROVEDORES.
+Exercita a API ponta a ponta contra o docker compose: autenticacao real no Keycloak,
+abertura de carteira, apostas, idempotencia, rejeicao por saldo, extrato paginado,
+reconciliacao e isolamento entre provedores (criterios de aceite da secao 13).
 
-	Serve para duas coisas: (a) provar rapidamente que o sistema funciona apos o
-	`docker compose up`; (b) servir de EXEMPLO DE USO da API (secao 15 do spec).
+Rodar: powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1
+Pre-requisito: `docker compose up -d` (API em :8081, Keycloak em :8080).
 
-	Equivale, no nivel HTTP, aos criterios de aceite da secao 13.
+NOTA DE ENCODING: manter este arquivo em ASCII puro. O PowerShell 5.1 le .ps1 sem BOM
+na codepage ANSI e bytes UTF-8 viram sequencias invalidas ("MissingEndCurlyBrace").
 
-COMO RODAR
-	powershell -ExecutionPolicy Bypass -File scripts/smoke-test.ps1
-
-PRE-REQUISITO
-	`docker compose up -d` ja executado (API em http://localhost:8081 e
-	Keycloak em http://localhost:8080).
-
-NOTA SOBRE ENCODING (um bug real que este arquivo teve)
-	O arquivo original tinha acentos. O Windows PowerShell 5.1 le arquivos .ps1
-	sem BOM usando a codepage ANSI do sistema, e os bytes UTF-8 viravam
-	sequencias invalidas - quebrando o parser com "MissingEndCurlyBrace".
-	Solucao: manter este script em ASCII puro.
-
-OBSERVACAO
-	O playerId e gerado a cada execucao, porque (playerId, currency) e unico por
-	carteira: reutilizar o mesmo jogador faria a segunda execucao receber 409 -
-	comportamento CORRETO do sistema, mas que atrapalharia o teste.
-=============================================================================
+O playerId e gerado a cada execucao: (playerId, currency) e unico, entao reutilizar
+o mesmo jogador faria a segunda execucao receber 409 (correto, mas atrapalha o teste).
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -97,9 +77,7 @@ function Get-StatusCode {
 	}
 }
 
-# -----------------------------------------------------------------------------
 # 1) Health checks publicos (secao 12)
-# -----------------------------------------------------------------------------
 Write-Step "Health checks"
 
 $live = Invoke-RestMethod -Method Get -Uri "$ApiBase/health/live"
@@ -110,9 +88,7 @@ Assert-Equal 'ready' $ready.status 'readiness'
 Assert-Equal 'ok' $ready.dependencies.postgres 'postgres disponivel'
 Assert-Equal 'ok' $ready.dependencies.sqs 'sqs disponivel'
 
-# -----------------------------------------------------------------------------
 # 2) Autenticacao (secao 2)
-# -----------------------------------------------------------------------------
 Write-Step "Autenticacao"
 
 $internalToken = Get-Token 'internal-service' 'dev-internal-service-secret'
@@ -129,9 +105,7 @@ $providerBHeaders = @{ Authorization = "Bearer $providerBToken" }
 $semToken = Get-StatusCode { Invoke-RestMethod -Method Get -Uri "$ApiBase/wallets/qualquer" }
 Assert-Equal 401 $semToken 'requisicao sem token recusada'
 
-# -----------------------------------------------------------------------------
 # 3) Abertura de carteira (secao 9) - cenarios da secao 8: saldo de 100.00
-# -----------------------------------------------------------------------------
 Write-Step "Abertura de carteira com 100.00"
 
 $playerId = [guid]::NewGuid().ToString()
@@ -142,9 +116,7 @@ Assert-Equal '100.00' $wallet.balance.amount 'saldo inicial'
 Assert-Equal 1 $wallet.version 'versao inicial'
 $walletId = $wallet.id
 
-# -----------------------------------------------------------------------------
 # 4) Cenario obrigatorio da secao 8: duas apostas de 80.00 sobre saldo de 100.00
-# -----------------------------------------------------------------------------
 Write-Step "Duas apostas de 80.00 sobre saldo de 100.00 (secao 8)"
 
 function New-BetBody([string]$externalId, [string]$amount) {
@@ -171,9 +143,7 @@ $secondBet = Invoke-Api -Method Post -Path '/wagering/transactions' -Headers $pr
 Assert-Equal 'REJECTED' $secondBet.status 'segunda aposta rejeitada'
 Assert-Equal 'BET_INSUFFICIENT_FUNDS' $secondBet.failureCode 'codigo de falha'
 
-# -----------------------------------------------------------------------------
 # 5) Idempotencia (secao 9): reenvio da MESMA operacao
-# -----------------------------------------------------------------------------
 Write-Step "Reenvio da mesma aposta (idempotencia)"
 
 $replay = Invoke-Api -Method Post -Path '/wagering/transactions' -Headers $providerAHeaders -Body (New-BetBody 'bet-1' '80.00') -IdempotencyKey 'provider-a:bet-1'
@@ -183,9 +153,7 @@ Assert-Equal $firstBet.transactionId $replay.transactionId 'mesmo transactionId'
 Assert-Equal '20.00' $replay.balance.amount 'saldo do processamento ORIGINAL'
 Assert-Equal 'PROCESSED' $replay.status 'status preservado'
 
-# -----------------------------------------------------------------------------
 # 6) Conflito: mesma chave, conteudo diferente (secao 9)
-# -----------------------------------------------------------------------------
 Write-Step "Conflito de idempotencia (mesma chave, conteudo diferente)"
 
 $conflictStatus = Get-StatusCode {
@@ -193,9 +161,7 @@ $conflictStatus = Get-StatusCode {
 }
 Assert-Equal 409 $conflictStatus 'conflito de payload'
 
-# -----------------------------------------------------------------------------
 # 7) Consulta de carteira, extrato e reconciliacao (secao 9)
-# -----------------------------------------------------------------------------
 Write-Step "Consulta de carteira, extrato e reconciliacao"
 
 $currentWallet = Invoke-Api -Method Get -Path "/wallets/$walletId" -Headers $internalHeaders
@@ -214,9 +180,7 @@ Assert-Equal $true $reconciliation.consistent 'reconciliacao consistente'
 Assert-Equal '0.00' $reconciliation.difference.amount 'diferenca zero'
 Assert-Equal '20.00' $reconciliation.calculatedBalance.amount 'saldo reconstruido do ledger'
 
-# -----------------------------------------------------------------------------
 # 8) Isolamento entre provedores (secao 2 / secao 13)
-# -----------------------------------------------------------------------------
 Write-Step "Isolamento entre provedores"
 
 $providerBStatus = Get-StatusCode {
@@ -232,9 +196,7 @@ $providerWalletStatus = Get-StatusCode {
 }
 Assert-Equal 403 $providerWalletStatus 'provedor nao acessa carteira diretamente'
 
-# -----------------------------------------------------------------------------
 # 9) Rejeicao de OPENING por canal externo (secao 6.3)
-# -----------------------------------------------------------------------------
 Write-Step "OPENING recusado por canal externo"
 
 $openingBody = @{
@@ -253,9 +215,7 @@ $openingStatus = Get-StatusCode {
 }
 Assert-Equal 422 $openingStatus 'OPENING recusado com 422'
 
-# -----------------------------------------------------------------------------
 # Resultado
-# -----------------------------------------------------------------------------
 Write-Host ""
 if ($script:failures -gt 0) {
 	Write-Host "RESULTADO: $($script:failures) verificacao(oes) falharam" -ForegroundColor Red

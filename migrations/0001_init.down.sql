@@ -1,25 +1,6 @@
--- =============================================================================
--- migrations/0001_init.down.sql
--- =============================================================================
--- PROPÓSITO
---   Reverter EXATAMENTE o que 0001_init.up.sql criou, na ordem inversa de
---   dependência. Atende ao §4/§15 ("reversão documentada").
---
--- CAMADA: infrastructure bootstrap (schema).
---
--- ORDEM DE DROP (por que importa)
---   1. Tabelas com FK para outras tabelas caem primeiro (ledger -> transactions
---      -> wallets), senão o DROP falha por dependência.
---   2. Triggers e a função do ledger caem junto com a tabela; ainda assim,
---      removemos a função explicitamente porque ela é um objeto compartilhado.
---   3. Índices parciais criados fora das tabelas são removidos pelo DROP TABLE
---      (Postgres remove índices da tabela automaticamente).
---
--- ARMADILHA CLÁSSICA
---   Rodar o down sem DROP ORDER correto resulta em erro
---   "cannot drop table wallets because other objects depend on it". A ordem
---   abaixo é o inverso exato de criação.
--- =============================================================================
+-- Reverte 0001 na ordem inversa de dependência (ledger -> transactions -> wallets),
+-- senão o DROP falha com "cannot drop table wallets because other objects depend
+-- on it". A função do ledger é removida explicitamente (objeto compartilhado).
 
 DROP TABLE IF EXISTS outbox_events;
 DROP TABLE IF EXISTS inbox_messages;

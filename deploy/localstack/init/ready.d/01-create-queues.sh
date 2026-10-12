@@ -1,56 +1,15 @@
 #!/usr/bin/env bash
-# =============================================================================
-# deploy/localstack/init/ready.d/01-create-queues.sh
-# =============================================================================
-# PROPÓSITO
-#   Provisionar, de forma automática e idempotente, a topologia de filas SQS
-#   exigida pelo §10 do spec:
-#     - wager-transactions.fifo      (entrada de operações)
-#     - wager-transactions-dlq.fifo  (DLQ da fila de entrada, com redrive)
-#     - wager-events.fifo            (destino dos eventos da outbox, §11)
-#     - wager-events-dlq.fifo        (DLQ dos eventos de saída)
+# Provisiona (idempotente) a topologia de filas SQS FIFO do §10/§11:
+#   wager-transactions.fifo / -dlq.fifo   entrada de operações (redrive maxReceiveCount=5)
+#   wager-events.fifo       / -dlq.fifo   eventos da outbox
 #
-# CAMADA DA ARQUITETURA HEXAGONAL
-#   infrastructure bootstrap. Este script não é código de domínio nem adapter Go:
-#   ele apenas materializa o broker que os adapters outbound (SQS publisher) e
-#   inbound (SQS consumer) vão usar.
+# `ready.d` roda UMA vez, quando o LocalStack está pronto (com `boot.d` haveria
+# "connection refused"). FIFO em todas: o MessageGroupId ordena por grupo; a
+# serialização física real é o lock de linha no banco (§5.3).
 #
-# POR QUE ASSIM
-#   1. `ready.d` é o hook do LocalStack executado UMA vez, quando o serviço está
-#      pronto para receber chamadas à API. Usar `boot.d` causaria
-#      "connection refused" porque a API SQS ainda não estaria no ar.
-#   2. `awslocal` é um wrapper do AWS CLI já instalado na imagem do LocalStack:
-#      injeta endpoint/credenciais de teste automaticamente.
-#   3. FIFO em todas as filas: o §8 exige coordenação POR CARTEIRA, e o
-#      `MessageGroupId` (que só existe em fila FIFO) é o mecanismo de ordenação
-#      por grupo. A serialização física real continua no banco (§5.3).
-#   4. `ContentBasedDeduplication=false`: enviamos o `MessageDeduplicationId`
-#      explicitamente (o eventId estável, §11), preservando-o em republicações.
-#   5. A DLQ é criada PRIMEIRO porque a RedrivePolicy precisa do ARN dela.
-#      `maxReceiveCount=5` move para a DLQ após a quinta tentativa (§10).
-#
-# ARMADILHA QUE CUSTOU UMA CORREÇÃO (registrada aqui de propósito)
-#   A RedrivePolicy NÃO pode ser passada pelo parser "shorthand" do
-#   `--attributes chave=valor,chave=valor`: a política é um JSON que contém
-#   RÓTULOS, VÍRGULAS e ASPAS, e o parser do AWS CLI tenta dividir o valor nas
-#   vírgulas e encontra aspas onde esperava '='. O erro é:
-#
-#       Error parsing parameter '--attributes': Expected: '=', received: '"'
-#
-#   A solução é enviar o documento JSON inteiro via `--cli-input-json file://...`,
-#   que não passa pelo shorthand. É o padrão correto para parâmetros aninhados.
-#
-# VALIDAÇÃO LOCAL
-#   awslocal sqs list-queues
-#   awslocal sqs get-queue-attributes \
-#       --queue-url http://localhost:4566/000000000000/wager-transactions.fifo \
-#       --attribute-names All
-#
-# ARMADILHA CLÁSSICA DE SHELL
-#   `set -euo pipefail` faz o script morrer no primeiro erro. Sem isso, a falha
-#   acima ficaria silenciosa e só descobriríamos em runtime, com a fila principal
-#   inexistente — um bug caro.
-# =============================================================================
+# ARMADILHA: a RedrivePolicy é um JSON com vírgulas e aspas e NÃO passa pelo parser
+# shorthand do `--attributes` ("Expected: '=', received: '\"'"); usar
+# `--cli-input-json`. `set -euo pipefail` faz o script morrer no primeiro erro.
 
 set -euo pipefail
 

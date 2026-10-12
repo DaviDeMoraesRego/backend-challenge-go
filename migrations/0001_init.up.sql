@@ -1,46 +1,11 @@
--- =============================================================================
--- migrations/0001_init.up.sql
--- =============================================================================
--- PROPÓSITO
---   Criar o schema inicial do serviço de processamento de apostas. Este arquivo
---   é o CÓDIGO onde as invariantes financeiras do §5 são impostas pelo banco,
---   independentemente de locks de aplicação ou da deduplicação do SQS FIFO
---   (§5.3). Se a aplicação Go tiver um bug, o banco ainda deve recusar estados
---   financeiros inválidos.
+-- Schema inicial. As invariantes financeiras do §5 são impostas AQUI (não só na
+-- aplicação): se o Go tiver um bug, o banco ainda recusa estado financeiro inválido.
 --
--- CAMADA DA ARQUITETURA HEXAGONAL
---   infrastructure bootstrap (o "fora" do hexágono). O domínio Go conhece
---   Value Objects e agregados, NÃO estas tabelas. O mapeamento tabela<->domínio
---   acontece exclusivamente nos adapters outbound (Postgres).
---
--- DECISÕES DE MODELAGEM (e por quê)
---   1. Dinheiro em BIGINT de unidades mínimas (centavos). Nunca NUMERIC nem
---      FLOAT para movimentação (§5.1: proibido float; escala fixa 2, §6.1).
---   2. Estados/kinds/direções como TEXT + CHECK (em vez de ENUM do Postgres):
---      CHECK é fácil de alterar em migrations futuras; ENUM exige ALTER TYPE e
---      acopla o valor ao tipo físico. As transições válidas são validadas no
---      domínio; o banco garante que só valores conhecidos entram.
---   3. Constraints que impedem o que o spec proíbe:
---      - saldo nunca negativo (CHECK balance_minor >= 0) -> §5.7/§6.2;
---      - cadeia de saldo do ledger (balanceAfter = balanceBefore ± amount);
---      - LOSS exige amount = 0 e demais tipos exigem amount > 0 (§7);
---      - unicidade de idempotência, de (provider, externalId) e de reversão;
---      - crédito inicial (OPENING) único por carteira (§6.3).
---   4. Ledger append-only imposto por TRIGGER (não só por convenção): UPDATE,
---      DELETE e TRUNCATE levantam exceção. Corregões financeiras exigem NOVOS
---      lançamentos (§5.5).
---
--- VALIDAÇÃO LOCAL
---   docker compose run --rm migrate -path=/migrations \
---     -database=postgres://wager:wager@postgres:5432/wager?sslmode=disable up 1
---   psql postgres://wager:wager@localhost:5432/wager -c '\d wallet_ledger_entries'
---
--- ARMADILHA CLÁSSICA DE MIGRATION
---   Migrations devem ser FORWARD-ONLY e cada arquivo .up.sql precisa ter um
---   .down.sql que reverte exatamente o que foi criado, na ordem inversa de
---   dependência (índices/funções antes das tabelas). Esquecer isso invalida a
---   "aplicação e reversão documentadas" exigida no §4/§15.
--- =============================================================================
+-- Decisões: dinheiro em BIGINT de centavos (nunca NUMERIC/FLOAT); estados/kinds
+-- como TEXT + CHECK (mais fácil de evoluir que ENUM); saldo nunca negativo, cadeia
+-- de saldo no ledger (balanceAfter = balanceBefore ± amount), LOSS com amount = 0,
+-- unicidade de idempotência e de (provider, externalId), OPENING único por carteira;
+-- ledger append-only imposto por TRIGGER (UPDATE/DELETE/TRUNCATE recusados).
 
 -- -----------------------------------------------------------------------------
 -- 1) WALLETS — raiz do agregado financeiro (§6.2).

@@ -1,31 +1,8 @@
-# =============================================================================
-# Makefile
-# =============================================================================
-# PROPÓSITO
-#   Atalhos reproduzíveis para o fluxo de desenvolvimento: subir o ambiente,
-#   aplicar/reverter migrations, rodar testes e inspecionar recursos. Atende ao
-#   §15 (comandos reproduzíveis a partir de um checkout limpo).
+# Atalhos reproduzíveis: subir o ambiente, migrations, testes e inspeção. Tudo passa
+# por `docker compose` — nada depende de ferramentas instaladas globalmente.
 #
-# CAMADA DA ARQUITETURA HEXAGONAL
-#   infrastructure bootstrap (ferramental de operação).
-#
-# POR QUE ASSIM
-#   - Todos os comandos passam por `docker compose`, que é o único pré-requisito
-#     além do Go. Nada depende de ferramentas instaladas globalmente (psql, aws
-#     cli, migrate) — usamos os containers para isso.
-#   - Alvos granulares permitem validar cada peça isoladamente durante o
-#     desenvolvimento (ex.: `make migrate-up` sem subir a app).
-#
-# ATENÇÃO (Windows/cmd)
-#   Arquivos Makefile usam TAB para indentar comandos; espaços causam o erro
-#   "missing separator". Este arquivo já usa TAB. No Windows, rode via WSL,
-#   Git Bash ou `make` do Chocolatey/Scoop.
-#
-# VALIDAÇÃO
-#   make up        # sobe Postgres, LocalStack, Keycloak e aplica migrations
-#   make ps        # mostra o status dos containers
-#   make queues    # lista as filas provisionadas
-# =============================================================================
+# ATENÇÃO (Windows): o Makefile usa TAB para indentar comandos. Rode via WSL, Git
+# Bash ou `make` do Chocolatey/Scoop.
 
 # Comando base do Compose (uma vez definido, evita repetição e erro de digitação).
 COMPOSE := docker compose

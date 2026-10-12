@@ -1,51 +1,15 @@
 /*
-=============================================================================
-tests/k6/bet-flow.js
-=============================================================================
-PROPOSITO
-	Teste de carga do fluxo principal de apostas: autenticacao real no Keycloak,
-	abertura de carteira, envio de operacoes e leitura do extrato — com CENARIOS
-	distintos (ramp-up, pico e soak) e THRESHOLDS EXPLICITOS.
+Teste de carga do fluxo de apostas: autenticacao real no Keycloak, abertura de
+carteira e envio de operacoes, com cenarios e thresholds explicitos.
 
-COMO RODAR
-	docker run --rm -i --network host -v "%cd%/tests/k6":/scripts grafana/k6 \
-	  run /scripts/bet-flow.js
+Rodar: docker run --rm -i --network host -v "%cd%/tests/k6":/scripts grafana/k6 run /scripts/bet-flow.js
+Cenario unico: k6 run -e SCENARIO=ramp_up tests/k6/bet-flow.js
 
-	Ou, com k6 instalado no host:
-	k6 run tests/k6/bet-flow.js
+Cenarios: ramp_up (joelho da curva), spike (recuperacao apos rajada), soak (vazamentos).
+Thresholds sao ASSERTIVAS: o k6 sai != 0 se falharem (usavel em CI).
 
-	Para escolher um cenario especifico:
-	k6 run -e SCENARIO=ramp_up tests/k6/bet-flow.js
-
-=== O QUE ESTE TESTE MEDE, E POR QUE CADA CENARIO EXISTE ===
-
-	ramp_up  — carga CRESCENTE e sustentada. Revela o ponto em que a latencia
-	           comeca a degradar (o joelho da curva) e valida que o sistema aguenta
-	           o regime normal com folga.
-
-	spike    — salto REPENTINO para carga alta e retorno imediato. Revela se o
-	           sistema se recupera apos uma rajada: pool de conexoes saturado,
-	           filas acumuladas no broker, workers atrasados. Um sistema pode
-	           passar no ramp-up e falhar aqui.
-
-	soak     — carga MODERADA por tempo LONGO. Revela vazamentos: goroutines nao
-	           encerradas, conexoes que nao voltam ao pool, memoria crescendo. E o
-	           unico cenario em que esse tipo de defeito aparece.
-
-=== SOBRE OS THRESHOLDS ===
-	Thresholds sao ASSERTIVAS, nao enfeite: o k6 termina com codigo != 0 se algum
-	falhar, o que torna o teste utilizavel em CI.
-
-	Os valores abaixo sao ponto de partida para o ambiente LOCAL do docker
-	compose (LocalStack + Postgres no mesmo host). Em uma execucao real, ajuste-os
-	apos a PRIMEIRA medicao — threshold que nunca falha nao protege nada, e
-	threshold que falha sempre nao e usado.
-
-=== O QUE ESTE TESTE NAO E ===
-	Nao e um benchmark de throughput absoluto: o LocalStack e o Postgres rodam no
-	mesmo host e disputam CPU com o proprio k6. Os numeros servem para comparar
-	EXECUCOES entre si (regressao), nao para prever producao.
-=============================================================================
+Os numeros servem para comparar execucoes entre si (regressao): LocalStack e Postgres
+rodam no mesmo host e disputam CPU com o k6.
 */
 
 import http from 'k6/http';
@@ -53,9 +17,7 @@ import { check, sleep, group } from 'k6';
 import { Counter, Trend } from 'k6/metrics';
 import { randomUUID } from 'https://jslib.k6.io/k6-utils/1.4.0/index.js';
 
-// -----------------------------------------------------------------------------
 // Configuracao
-// -----------------------------------------------------------------------------
 
 const API_BASE = __ENV.API_BASE || 'http://localhost:8081';
 const KEYCLOAK_BASE = __ENV.KEYCLOAK_BASE || 'http://localhost:8080';
@@ -68,9 +30,7 @@ const betsRejected = new Counter('bets_rejected');
 const betsReplayed = new Counter('bets_idempotent_replay');
 const balanceObserved = new Trend('bet_balance_observed', true);
 
-// -----------------------------------------------------------------------------
 // Cenarios
-// -----------------------------------------------------------------------------
 
 const selectedScenario = __ENV.SCENARIO;
 
@@ -141,9 +101,7 @@ function buildScenarios(only) {
 	return all;
 }
 
-// -----------------------------------------------------------------------------
 // setup: tokens e carteiras
-// -----------------------------------------------------------------------------
 
 // setup roda UMA vez, antes da carga. Aqui buscamos os tokens e criamos uma
 // carteira por VU previsto — porque (playerId, currency) e unico, duas VUs nao
@@ -196,9 +154,7 @@ function jsonHeaders(token) {
 	return { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
 }
 
-// -----------------------------------------------------------------------------
 // Fluxo principal
-// -----------------------------------------------------------------------------
 
 export function betFlow(data) {
 	// Cada VU fica com uma carteira propria: assim a carga nao serializa numa
@@ -261,9 +217,7 @@ export function betFlow(data) {
 	sleep(Math.random() * 0.5 + 0.2);
 }
 
-// -----------------------------------------------------------------------------
 // Cenario de IDEMPOTENCIA sob carga
-// -----------------------------------------------------------------------------
 
 // duplicateFlow dispara a MESMA operacao varias vezes em paralelo e verifica que
 // apenas uma movimenta o saldo. E o cenario da secao 13 do spec executado sob
